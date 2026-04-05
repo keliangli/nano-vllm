@@ -1,4 +1,5 @@
 import pickle
+import os
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -11,6 +12,11 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
+
 
 class ModelRunner:
 
@@ -22,8 +28,13 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.kv_cache_ready = False
+        self.flashinfer_workspace = None
+        self.flashinfer_prefill_wrapper = None
+        self.flashinfer_decode_wrapper = None
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -47,6 +58,92 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _ensure_flashinfer_wrappers(self):
+        if flashinfer is None:
+            return False
+        if not self.enforce_eager:
+            return False
+        if os.getenv("NANOVLLM_DISABLE_FLASHINFER_BATCHED", "").lower() in {"1", "true", "yes", "on"}:
+            return False
+        if os.getenv("NANOVLLM_DISABLE_FLASHINFER", "").lower() in {"1", "true", "yes", "on"}:
+            return False
+        if self.flashinfer_prefill_wrapper is not None and self.flashinfer_decode_wrapper is not None:
+            return True
+        if self.flashinfer_workspace is None:
+            # Shared workspace reused across prefill/decode and all layers.
+            self.flashinfer_workspace = torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        self.flashinfer_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.flashinfer_workspace, "NHD"
+        )
+        self.flashinfer_decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self.flashinfer_workspace, "NHD"
+        )
+        return True
+
+    def _plan_flashinfer(self, seqs: list[Sequence], is_prefill: bool, qo_indptr: list[int] | None = None):
+        if not self.kv_cache_ready:
+            return None
+        if not self._ensure_flashinfer_wrappers():
+            return None
+
+        hf_config = self.config.hf_config
+        num_qo_heads = hf_config.num_attention_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+
+        paged_kv_indptr = [0]
+        paged_kv_indices = []
+        paged_kv_last_page_len = []
+        seq_lens = []
+        seq_lens_q = []
+        for seq in seqs:
+            paged_kv_indices.extend(seq.block_table)
+            paged_kv_indptr.append(len(paged_kv_indices))
+            paged_kv_last_page_len.append(seq.last_block_num_tokens)
+            seq_lens.append(len(seq))
+            seq_lens_q.append(len(seq) - seq.num_cached_tokens if is_prefill else 1)
+
+        paged_kv_indptr = torch.tensor(paged_kv_indptr, dtype=torch.int32)
+        paged_kv_indices = torch.tensor(paged_kv_indices, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(paged_kv_last_page_len, dtype=torch.int32)
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+
+        if is_prefill:
+            wrapper = self.flashinfer_prefill_wrapper
+            qo_indptr = torch.tensor(qo_indptr, dtype=torch.int32)
+            seq_lens_q = torch.tensor(seq_lens_q, dtype=torch.int32)
+            wrapper.plan(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                self.block_size,
+                causal=True,
+                q_data_type=hf_config.torch_dtype,
+                kv_data_type=hf_config.torch_dtype,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
+            )
+            return wrapper
+
+        wrapper = self.flashinfer_decode_wrapper
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            self.block_size,
+            q_data_type=hf_config.torch_dtype,
+            kv_data_type=hf_config.torch_dtype,
+            seq_lens=seq_lens,
+        )
+        return wrapper
+
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
@@ -56,7 +153,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self.world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -93,7 +191,9 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        # Limit warmup sequence length to avoid memory issues
+        warmup_len = min(max_model_len, 1024)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -116,6 +216,7 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        self.kv_cache_ready = True
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -151,6 +252,7 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
+        flashinfer_wrapper = self._plan_flashinfer(seqs, True, cu_seqlens_q)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -158,7 +260,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, flashinfer_wrapper)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -171,12 +273,13 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+        flashinfer_wrapper = self._plan_flashinfer(seqs, False)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, flashinfer_wrapper=flashinfer_wrapper)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

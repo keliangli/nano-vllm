@@ -6,6 +6,14 @@ import torch.distributed as dist
 from nanovllm.utils.context import get_context
 
 
+def get_tp_rank() -> int:
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def get_tp_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -14,8 +22,8 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size

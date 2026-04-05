@@ -11,6 +11,10 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+def get_tp_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -26,7 +30,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
